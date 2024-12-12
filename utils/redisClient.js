@@ -61,17 +61,54 @@ class RedisClient {
   }
 
   async hGetAll(key) {
-  try {
-    if (!this.isConnected) {
-      await this.connect();
+    try {
+      if (!this.isConnected) {
+        await this.connect();
+      }
+      const data = await this.client.hgetall(key); // ioredis는 hgetall 사용
+      return data;
+    } catch (error) {
+      console.error('Redis hGetAll error:', error);
+      throw error;
     }
-    const data = await this.client.hgetall(key); // ioredis는 hgetall 사용
-    return data;
-  } catch (error) {
-    console.error('Redis hGetAll error:', error);
-    throw error;
   }
-}
+
+  async hSet(key, field, value) {
+    try {
+      if (!this.isConnected) {
+        await this.connect();
+      }
+      // Redis의 HSET 명령어는 필드와 값을 받아 해시에 설정합니다.
+      return await this.client.hset(key, field, value);
+    } catch (error) {
+      console.error('Redis hSet error:', error);
+      throw error;
+    }
+  }
+
+  async hGet(key, field) {
+    try {
+      if (!this.isConnected) {
+        await this.connect();
+      }
+      return await this.client.hget(key, field);
+    } catch (error) {
+      console.error('Redis hGet error:', error);
+      throw error;
+    }
+  }
+
+  async hDel(key, field) {
+    try {
+      if (!this.isConnected) {
+        await this.connect();
+      }
+      return await this.client.hdel(key, field);
+    } catch (error) {
+      console.error('Redis hDel error:', error);
+      throw error;
+    }
+  }
 
   retryConnection() {
     if (this.connectionAttempts >= this.maxRetries) {
@@ -153,20 +190,6 @@ class RedisClient {
     }
   }
 
-  async quit() {
-    if (this.client) {
-      try {
-        await this.client.quit();
-        this.isConnected = false;
-        this.client = null;
-        console.log('Redis cluster connection closed successfully');
-      } catch (error) {
-        console.error('Redis cluster quit error:', error);
-        throw error;
-      }
-    }
-  }
-
   async delPattern(pattern) {
     try {
       if (!this.isConnected) {
@@ -192,6 +215,20 @@ class RedisClient {
       return JSON.parse(data);
     } catch {
       return data; // 문자열 그대로 반환
+    }
+  }
+
+  async quit() {
+    if (this.client) {
+      try {
+        await this.client.quit();
+        this.isConnected = false;
+        this.client = null;
+        console.log('Redis cluster connection closed successfully');
+      } catch (error) {
+        console.error('Redis cluster quit error:', error);
+        throw error;
+      }
     }
   }
 }

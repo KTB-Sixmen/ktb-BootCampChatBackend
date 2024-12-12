@@ -85,21 +85,59 @@ module.exports = function (io) {
       await consumer.subscribe({ topic: "chat_messages", fromBeginning: true });
 
       await consumer.run({
-        eachMessage: async ({ topic, partition, message }) => {
-          try {
-            const data = JSON.parse(message.value.toString());
-            if (topic === "message_responses") {
-              const { roomId, userId, result } = data;
-              io.to(userId).emit("previousMessagesLoaded", result);
-            } else if (topic === "chat_messages") {
-              const { roomId, message: chatMessage } = data;
-              io.to(roomId).emit("message", chatMessage);
-            }
-          } catch (error) {
-            console.error("Kafka consumer(error in eachMessage):", error);
-          }
-        },
-      });
+  eachMessage: async ({ topic, partition, message }) => {
+    try {
+      const data = JSON.parse(message.value.toString());
+
+      if (topic === "message_responses") {
+        const { roomId, userId, result } = data;
+        io.to(userId).emit("previousMessagesLoaded", result);
+      } else if (topic === "chat_messages") {
+        const { roomId, message: chatMessage } = data;
+
+        // AI 메시지인지 확인
+        const isAIMessage = chatMessage.type === 'ai';
+
+        // AI 메시지가 아닌 경우에만 'message' 이벤트를 통해 전송
+        if (!isAIMessage) {
+          io.to(roomId).emit("message", chatMessage);
+        }
+
+        // Redis 캐시 업데이트 (AI 메시지 포함)
+        const cacheKey = `chat:${roomId}:latest`;
+        const cachedData = await redisClient.get(cacheKey);
+        let messagesArr = [];
+
+        if (cachedData && cachedData.messages) {
+          messagesArr = cachedData.messages;
+        } else if (cachedData) {
+          // Redis에 messages 배열이 없는 경우 초기화
+          messagesArr = [];
+        }
+
+        messagesArr.push(chatMessage);
+
+        if (messagesArr.length > BATCH_SIZE) {
+          messagesArr.splice(0, messagesArr.length - BATCH_SIZE);
+        }
+
+        const hasMore = messagesArr.length === BATCH_SIZE;
+        const oldestTimestamp = messagesArr[0]?.timestamp || null;
+
+        const updatedResult = {
+          messages: messagesArr,
+          hasMore,
+          oldestTimestamp,
+        };
+
+        await redisClient.setEx(cacheKey, 600, updatedResult);
+        console.log(`[Redis] latest 캐시 업데이트: ${cacheKey}`);
+      }
+    } catch (error) {
+      console.error("Kafka consumer(error in eachMessage):", error);
+    }
+  },
+});
     } catch (error) {
       console.error("Kafka Response Consumer 연결 실패:", error);
     }
@@ -160,7 +198,10 @@ module.exports = function (io) {
             if (sortedMessages.length > 0) {
               const messageIds = sortedMessages.map((msg) => msg._id);
               await Message.updateMany(
-                { _id: { $in: messageIds }, "readers.userId": { $ne: userId } },
+                {
+                  _id: { $in: messageIds },
+                  "readers.userId": { $ne: userId },
+                },
                 { $push: { readers: { userId, readAt: new Date() } } }
               );
             }
@@ -335,22 +376,13 @@ module.exports = function (io) {
         if (!sessionValidation.isValid)
           throw new Error("세션이 만료되었습니다. 다시 로그인해주세요.");
 
-        // "/정답 " 명령어 처리 로직
         if (content && content.startsWith("/정답 ")) {
-          // "/정답 " 다음에 오는 사용자 이름 추출
           const answerName = content.substring("/정답 ".length).trim();
-
-          // AI 응답 건너뛰기: 즉, 메시지를 DB에 저장하거나 AI메시지 생성하지 않고
-          // 정답 체크 이벤트만 전송
-          // 사용자가 "용가리"면 정답, 아니면 오답
           const isCorrect = answerName === "용가리";
-
-          // 클라이언트에 이벤트 전송 -> 프런트엔드에서 socket.on("answerCheck", ...)로 받아 alert 실행
           io.to(room).emit("answerCheck", {
             correct: isCorrect,
             username: answerName,
           });
-
           return;
         }
 
@@ -410,6 +442,7 @@ module.exports = function (io) {
             throw new Error("지원하지 않는 메시지 타입입니다.");
         }
 
+        // DB에 메시지 저장
         await message.save();
         await message.populate([
           { path: "sender", select: "name email profileImage" },
@@ -433,41 +466,48 @@ module.exports = function (io) {
         await SessionService.updateLastActivity(socket.user.id);
 
         /** 가짜 AI 로직 부분 */
-        // const currentCount = roomMessageCountMap.get(room) || 0;
-        // const newCount = currentCount + 1;
-        // roomMessageCountMap.set(room, newCount);
+        const currentCount = roomMessageCountMap.get(room) || 0;
+        const newCount = currentCount + 1;
+        roomMessageCountMap.set(room, newCount);
 
-        // if (newCount >= 3) {
-        //   const recentMessage = await Message.findOne({ room })
-        //     .sort({ timestamp: -1 })
-        //     .lean();
+        if (newCount >= 2) {
+          const recentMessage = await Message.findOne({ room })
+            .sort({ timestamp: -1 })
+            .lean();
 
-        //   if (!recentMessage) {
-        //     throw new Error("최근 메시지를 가져올 수 없습니다.");
-        //   }
+          if (!recentMessage) {
+            throw new Error("최근 메시지를 가져올 수 없습니다.");
+          }
 
-        //   const ghostMsg = await aiService.generateGhostResponse(
-        //     recentMessage.content,
-        //     "dragonAI"
-        //   );
+          const ghostMsg = await aiService.generateGhostResponse(
+            // recentMessage.content,
+            message.content,
+            "dragonAI"
+          );
 
-        //   // 유령 AI 메시지 전송
-        //   const aiMessage = new Message({
-        //     room,
-        //     content: ghostMsg, // generateGhostResponse로 받은 응답
-        //     type: "ai",
-        //     aiType: "dragonAI", // ghostAI로 설정
-        //     timestamp: new Date(),
-        //     reactions: {},
-        //   });
+          // 유령 AI 메시지 전송
+          const aiMessage = new Message({
+            room,
+            content: ghostMsg, // generateGhostResponse로 받은 응답
+            type: "ai",
+            aiType: "dragonAI", // ghostAI로 설정
+            timestamp: new Date(),
+            reactions: {},
+          });
 
-        //   await aiMessage.save();
+          await aiMessage.save();
 
-        //   io.to(room).emit("message", aiMessage);
+          io.to(room).emit("message", aiMessage);
+          await producer.send({
+            topic: "chat_messages",
+            messages: [
+              { value: JSON.stringify({ roomId: room, message: aiMessage }) },
+            ],
+          });
 
-        //   // 카운트 초기화
-        //   roomMessageCountMap.set(room, 0);
-        // }
+          // 카운트 초기화
+          roomMessageCountMap.set(room, 0);
+        }
 
         logDebug("message processed", {
           messageId: message._id,
@@ -480,6 +520,9 @@ module.exports = function (io) {
         let messagesArr = [];
         if (cachedData && cachedData.messages) {
           messagesArr = cachedData.messages;
+        } else if (cachedData) {
+          // Redis에 messages 배열이 없는 경우 초기화
+          messagesArr = [];
         }
         messagesArr.push(message.toObject());
         if (messagesArr.length > BATCH_SIZE) {
@@ -504,6 +547,9 @@ module.exports = function (io) {
         });
       }
     });
+
+    // 이하 코드는 변동 없음, AI 메시지를 저장할 때도 DB에 메시지 저장하는 로직 포함
+    // handleAIResponse 함수 내 onComplete 콜백에서 aiMessage 생성 후 aiMessage.save() 수행 중
 
     socket.on("joinRoom", async (roomId) => {
       try {
@@ -984,7 +1030,7 @@ module.exports = function (io) {
         onComplete: async (finalContent) => {
           await redisClient.hDel(STREAMING_SESSIONS_KEY, messageId);
 
-          const aiMessage = await Message.create({
+          const aiMessage = new Message({
             room,
             content: finalContent.content,
             type: "ai",
@@ -998,6 +1044,12 @@ module.exports = function (io) {
               totalTokens: finalContent.totalTokens,
             },
           });
+
+          await aiMessage.save();
+          await aiMessage.populate([
+            { path: "sender", select: "name email profileImage" },
+            { path: "file", select: "filename originalname mimetype size" },
+          ]);
 
           await producer.send({
             topic: "chat_messages",

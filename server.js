@@ -20,6 +20,7 @@ const corsOptions = {
   origin: [
     "https://bootcampchat-fe.run.goorm.site",
     "https://chat.goorm-ktb-012.goorm.team",
+    "http://localhost:8000",
     "http://localhost:3000",
     "https://localhost:3000",
     "http://0.0.0.0:3000",
