@@ -1,4 +1,4 @@
-// chat.js
+// backend/sockets/chat.js
 
 const { Kafka } = require('kafkajs');
 const Message = require('../models/Message');
@@ -11,17 +11,36 @@ const redisClient = require('../utils/redisClient');
 const SessionService = require('../services/sessionService');
 const aiService = require('../services/aiService');
 
+const { createAdapter } = require('@socket.io/redis-adapter');
+const { Cluster } = require('ioredis');
+
 const BATCH_SIZE = 50;
-const LOAD_DELAY = 300;
-const MAX_RETRIES = 3;
 const MESSAGE_LOAD_TIMEOUT = 10000;
-const RETRY_DELAY = 2000;
 const DUPLICATE_LOGIN_TIMEOUT = 10000;
+const STREAMING_SESSIONS_KEY = 'streaming_sessions';
+
+// Redis 클러스터 노드 하드코딩
+const clusterNodes = [
+  { host: '43.200.132.202', port: 6379 },
+  { host: '43.202.183.198', port: 6379 },
+  { host: '54.180.154.20', port: 6379 },
+  { host: '3.37.73.237', port: 6379 },
+  { host: '43.203.14.223', port: 6379 },
+  { host: '3.37.123.80', port: 6379 },
+];
+
+// Redis 클러스터 클라이언트 생성 (Socket.IO 어댑터 용)
+const pubClient = new Cluster(clusterNodes);
+const subClient = pubClient.duplicate();
+
+pubClient.on('connect', () => console.log('Redis Cluster connected (pubClient)'));
+pubClient.on('error', (err) => console.error('Redis Cluster error (pubClient):', err));
+subClient.on('connect', () => console.log('Redis Cluster connected (subClient)'));
+subClient.on('error', (err) => console.error('Redis Cluster error (subClient):', err));
 
 module.exports = function(io) {
-  const connectedUsers = new Map();
-  const streamingSessions = new Map();
-  const userRooms = new Map();
+  // Redis Adapter 설정
+  io.adapter(createAdapter(pubClient, subClient));
 
   const kafka = new Kafka({
     clientId: process.env.KAFKA_CLIENT_ID || 'chat-service',
@@ -55,11 +74,7 @@ module.exports = function(io) {
             const data = JSON.parse(message.value.toString());
             if (topic === 'message_responses') {
               const { roomId, userId, result } = data;
-              const socketId = connectedUsers.get(userId);
-              if (!socketId) return;
-
-              const socket = io.sockets.sockets.get(socketId);
-              if (socket) socket.emit('previousMessagesLoaded', result);
+              io.to(userId).emit('previousMessagesLoaded', result);
             } else if (topic === 'chat_messages') {
               const { roomId, message: chatMessage } = data;
               io.to(roomId).emit('message', chatMessage);
@@ -82,7 +97,6 @@ module.exports = function(io) {
 
       await requestConsumer.run({
         eachMessage: async ({ topic, partition, message }) => {
-          // 기존 Kafka 요청 처리 로직 - 필요시 유지
           try {
             const { roomId, before, userId } = JSON.parse(message.value.toString());
             const cacheKey = `chat:${roomId}:before:${before || 'noBefore'}`;
@@ -150,10 +164,24 @@ module.exports = function(io) {
       const decoded = jwt.verify(token, jwtSecret);
       if (!decoded?.user?.id) return next(new Error('Invalid token'));
 
-      const existingSocketId = connectedUsers.get(decoded.user.id);
-      if (existingSocketId) {
-        const existingSocket = io.sockets.sockets.get(existingSocketId);
-        if (existingSocket) await handleDuplicateLogin(existingSocket, socket);
+      const existingSockets = await io.in(decoded.user.id).fetchSockets();
+      if (existingSockets.length > 0) {
+        for (const esocket of existingSockets) {
+          esocket.emit('duplicate_login', {
+            type: 'new_login_attempt',
+            deviceInfo: socket.handshake.headers['user-agent'],
+            ipAddress: socket.handshake.address,
+            timestamp: Date.now()
+          });
+
+          setTimeout(() => {
+            esocket.emit('session_ended', {
+              reason: 'duplicate_login',
+              message: '다른 기기에서 로그인하여 현재 세션이 종료되었습니다.'
+            });
+            esocket.disconnect(true);
+          }, DUPLICATE_LOGIN_TIMEOUT);
+        }
       }
 
       const validationResult = await SessionService.validateSession(decoded.user.id, sessionId);
@@ -182,12 +210,12 @@ module.exports = function(io) {
       next(new Error('Authentication failed'));
     }
   });
-  
+
   io.on('connection', (socket) => {
     logDebug('socket connected', { socketId: socket.id, userId: socket.user?.id, userName: socket.user?.name });
-    if (socket.user) connectedUsers.set(socket.user.id, socket.id);
 
-    // fetchPreviousMessages: 캐시 확인 → 없으면 DB 조회 + 캐시 저장
+    if (socket.user) socket.join(socket.user.id);
+
     socket.on('fetchPreviousMessages', async ({ roomId, before, limit = BATCH_SIZE }) => {
       try {
         if (!socket.user) throw new Error('Unauthorized');
@@ -197,14 +225,12 @@ module.exports = function(io) {
         socket.emit('messageLoadStart');
 
         if (before) {
-          // before 파라미터가 있으면 기존 로직대로 DB에서 조회 (캐시 사용X)
           const query = { room: roomId, timestamp: { $lt: new Date(before) } };
           const result = await loadMessagesDirect(query, limit);
           socket.emit('previousMessagesLoaded', result);
           return;
         }
 
-        // before가 없으면 최신 메시지 캐시 사용
         const cacheKey = `chat:${roomId}:latest`;
         const cachedData = await redisClient.get(cacheKey);
         if (cachedData) {
@@ -228,8 +254,6 @@ module.exports = function(io) {
       }
     });
 
-    // chatMessage 이벤트 시 캐시 업데이트
-    // 새 메시지 전송 시 캐시(lastest)를 업데이트하여 다음 조회 시 반영
     socket.on('chatMessage', async (messageData) => {
       try {
         if (!socket.user) throw new Error('Unauthorized');
@@ -251,7 +275,6 @@ module.exports = function(io) {
 
         switch (type) {
           case 'file':
-            console.log('File data received:',fileData);
             if (!fileData || !fileData._id) throw new Error('파일 데이터가 올바르지 않습니다.');
             const file = await File.findOne({ _id: fileData._id, user: socket.user.id });
             if (!file) throw new Error('파일을 찾을 수 없거나 접근 권한이 없습니다.');
@@ -297,7 +320,6 @@ module.exports = function(io) {
           messages: [{ value: JSON.stringify({ roomId: room, message }) }]
         });
 
-        // AI 멘션 처리
         if (aiMentions.length > 0) {
           for (const ai of aiMentions) {
             const query = content.replace(new RegExp(`@${ai}\\b`, 'g'), '').trim();
@@ -309,22 +331,18 @@ module.exports = function(io) {
 
         logDebug('message processed', { messageId: message._id, type: message.type, room });
 
-        // 메시지 전송 후 캐시 업데이트
         const cacheKey = `chat:${room}:latest`;
         const cachedData = await redisClient.get(cacheKey);
         let messagesArr = [];
         if (cachedData && cachedData.messages) {
           messagesArr = cachedData.messages;
         }
-
-        // 새 메시지 추가
         messagesArr.push(message.toObject());
-        // 최대 BATCH_SIZE 초과 시 오래된 메시지 제거
         if (messagesArr.length > BATCH_SIZE) {
           messagesArr.splice(0, messagesArr.length - BATCH_SIZE);
         }
 
-        const hasMore = (messagesArr.length === BATCH_SIZE); // 단순 추정
+        const hasMore = (messagesArr.length === BATCH_SIZE);
         const oldestTimestamp = messagesArr[0]?.timestamp || null;
         const updatedResult = { messages: messagesArr, hasMore, oldestTimestamp };
 
@@ -337,11 +355,11 @@ module.exports = function(io) {
     });
 
     socket.on('joinRoom', async (roomId) => {
-      // joinRoom 로직 기존 그대로
       try {
         if (!socket.user) throw new Error('Unauthorized');
 
-        const currentRoom = userRooms.get(socket.user.id);
+        const currentRooms = Array.from(socket.rooms).filter(r => r !== socket.id);
+        const currentRoom = currentRooms.length > 0 ? currentRooms[0] : null;
         if (currentRoom === roomId) {
           logDebug('already in room', { userId: socket.user.id, roomId });
           socket.emit('joinRoomSuccess', { roomId });
@@ -351,7 +369,6 @@ module.exports = function(io) {
         if (currentRoom) {
           logDebug('leaving current room', { userId: socket.user.id, roomId: currentRoom });
           socket.leave(currentRoom);
-          userRooms.delete(socket.user.id);
 
           const leaveMsg = {
             room: currentRoom,
@@ -378,7 +395,6 @@ module.exports = function(io) {
         if (!room) throw new Error('채팅방을 찾을 수 없습니다.');
 
         socket.join(roomId);
-        userRooms.set(socket.user.id, roomId);
 
         const joinMsg = {
           room: roomId,
@@ -391,16 +407,21 @@ module.exports = function(io) {
         const messageLoadResult = await loadMessages(socket, roomId);
         const { messages, hasMore, oldestTimestamp } = messageLoadResult;
 
-        const activeStreams = Array.from(streamingSessions.values())
-          .filter(session => session.room === roomId)
-          .map(session => ({
-            _id: session.messageId,
-            type: 'ai',
-            aiType: session.aiType,
-            content: session.content,
-            timestamp: session.timestamp,
-            isStreaming: true
-          }));
+        const activeStreams = [];
+        const allStreamingSessions = await redisClient.hGetAll(STREAMING_SESSIONS_KEY);
+        for (const [messageId, sessionData] of Object.entries(allStreamingSessions)) {
+          const session = JSON.parse(sessionData);
+          if (session.room === roomId) {
+            activeStreams.push({
+              _id: session.messageId,
+              type: 'ai',
+              aiType: session.aiType,
+              content: session.content,
+              timestamp: session.timestamp,
+              isStreaming: true
+            });
+          }
+        }
 
         socket.emit('joinRoomSuccess', {
           roomId,
@@ -426,11 +447,11 @@ module.exports = function(io) {
     });
 
     socket.on('leaveRoom', async (roomId) => {
-      // leaveRoom 로직 그대로
       try {
         if (!socket.user) throw new Error('Unauthorized');
 
-        const currentRoom = userRooms.get(socket.user.id);
+        const currentRooms = Array.from(socket.rooms).filter(r => r !== socket.id);
+        const currentRoom = currentRooms.length > 0 ? currentRooms[0] : null;
         if (!currentRoom || currentRoom !== roomId) {
           console.log(`User ${socket.user.id} is not in room ${roomId}`);
           return;
@@ -443,7 +464,6 @@ module.exports = function(io) {
         }
 
         socket.leave(roomId);
-        userRooms.delete(socket.user.id);
 
         const leaveMessage = await Message.create({
           room: roomId,
@@ -457,14 +477,9 @@ module.exports = function(io) {
           messages: [{ value: JSON.stringify({ roomId, message: leaveMessage }) }]
         });
 
-        const updatedRoom = await Room.findByIdAndUpdate(
+        await Room.findByIdAndUpdate(
           roomId, { $pull: { participants: socket.user.id } }, { new: true, runValidators: true }
         ).populate('participants', 'name email profileImage');
-
-        if (!updatedRoom) {
-          console.log(`Room ${roomId} not found during update`);
-          return;
-        }
 
         console.log(`User ${socket.user.id} left room ${roomId} successfully`);
       } catch (error) {
@@ -474,21 +489,18 @@ module.exports = function(io) {
     });
 
     socket.on('disconnect', async (reason) => {
-      // disconnect 로직 그대로
       if (!socket.user) return;
       try {
-        if (connectedUsers.get(socket.user.id) === socket.id) {
-          connectedUsers.delete(socket.user.id);
-        }
-
-        const roomId = userRooms.get(socket.user.id);
-        userRooms.delete(socket.user.id);
-
-        for (const [messageId, session] of streamingSessions.entries()) {
+        const allStreamingSessions = await redisClient.hGetAll(STREAMING_SESSIONS_KEY);
+        for (const [messageId, sessionData] of Object.entries(allStreamingSessions)) {
+          const session = JSON.parse(sessionData);
           if (session.userId === socket.user.id) {
-            streamingSessions.delete(messageId);
+            await redisClient.hDel(STREAMING_SESSIONS_KEY, messageId);
           }
         }
+
+        const currentRooms = Array.from(socket.rooms).filter(r => r !== socket.id);
+        const roomId = currentRooms.length > 0 ? currentRooms[0] : null;
 
         if (roomId && reason !== 'client namespace disconnect' && reason !== 'duplicate_login') {
           const leaveMessage = await Message.create({
@@ -515,7 +527,6 @@ module.exports = function(io) {
     });
 
     socket.on('force_login', async ({ token }) => {
-      // force_login 로직 그대로
       try {
         if (!socket.user) return;
         const decoded = jwt.verify(token, jwtSecret);
@@ -536,7 +547,6 @@ module.exports = function(io) {
     });
 
     socket.on('markMessagesAsRead', async ({ roomId, messageIds }) => {
-      // markMessagesAsRead 로직 그대로
       try {
         if (!socket.user) throw new Error('Unauthorized');
         if (!Array.isArray(messageIds) || messageIds.length === 0) return;
@@ -554,7 +564,6 @@ module.exports = function(io) {
     });
 
     socket.on('messageReaction', async ({ messageId, reaction, type }) => {
-      // messageReaction 로직 그대로
       try {
         if (!socket.user) throw new Error('Unauthorized');
         const message = await Message.findById(messageId);
@@ -647,42 +656,12 @@ module.exports = function(io) {
     return Array.from(mentions);
   }
 
-  async function handleDuplicateLogin(existingSocket, newSocket) {
-    try {
-      existingSocket.emit('duplicate_login', {
-        type: 'new_login_attempt',
-        deviceInfo: newSocket.handshake.headers['user-agent'],
-        ipAddress: newSocket.handshake.address,
-        timestamp: Date.now()
-      });
-
-      return new Promise((resolve) => {
-        setTimeout(async () => {
-          try {
-            existingSocket.emit('session_ended', {
-              reason: 'duplicate_login',
-              message: '다른 기기에서 로그인하여 현재 세션이 종료되었습니다.'
-            });
-            existingSocket.disconnect(true);
-            resolve();
-          } catch (error) {
-            console.error('Error during session termination:', error);
-            resolve();
-          }
-        }, DUPLICATE_LOGIN_TIMEOUT);
-      });
-    } catch (error) {
-      console.error('Duplicate login handling error:', error);
-      throw error;
-    }
-  }
-
   async function handleAIResponse(io, room, aiName, query) {
     const messageId = `${aiName}-${Date.now()}`;
     let accumulatedContent = '';
     const timestamp = new Date();
 
-    streamingSessions.set(messageId, {
+    const sessionData = {
       room,
       aiType: aiName,
       content: '',
@@ -690,7 +669,9 @@ module.exports = function(io) {
       timestamp,
       lastUpdate: Date.now(),
       reactions: {}
-    });
+    };
+
+    await redisClient.hSet(STREAMING_SESSIONS_KEY, messageId, JSON.stringify(sessionData));
 
     logDebug('AI response started', { messageId, aiType: aiName, room, query });
 
@@ -701,11 +682,12 @@ module.exports = function(io) {
         onStart: () => logDebug('AI generation started', { messageId, aiType: aiName }),
         onChunk: async (chunk) => {
           accumulatedContent += chunk.currentChunk || '';
-          const session = streamingSessions.get(messageId);
-          if (session) {
-            session.content = accumulatedContent;
-            session.lastUpdate = Date.now();
-          }
+          const updatedSession = {
+            ...sessionData,
+            content: accumulatedContent,
+            lastUpdate: Date.now()
+          };
+          await redisClient.hSet(STREAMING_SESSIONS_KEY, messageId, JSON.stringify(updatedSession));
 
           io.to(room).emit('aiMessageChunk', {
             messageId,
@@ -718,7 +700,7 @@ module.exports = function(io) {
           });
         },
         onComplete: async (finalContent) => {
-          streamingSessions.delete(messageId);
+          await redisClient.hDel(STREAMING_SESSIONS_KEY, messageId);
 
           const aiMessage = await Message.create({
             room,
@@ -753,8 +735,8 @@ module.exports = function(io) {
 
           logDebug('AI response completed', { messageId, aiType: aiName, contentLength: finalContent.content.length, generationTime: Date.now() - timestamp });
         },
-        onError: (error) => {
-          streamingSessions.delete(messageId);
+        onError: async (error) => {
+          await redisClient.hDel(STREAMING_SESSIONS_KEY, messageId);
           console.error('AI response error:', error);
 
           io.to(room).emit('aiMessageError', {
@@ -767,7 +749,7 @@ module.exports = function(io) {
         }
       });
     } catch (error) {
-      streamingSessions.delete(messageId);
+      await redisClient.hDel(STREAMING_SESSIONS_KEY, messageId);
       console.error('AI service error:', error);
 
       io.to(room).emit('aiMessageError', {

@@ -1,14 +1,23 @@
 // backend/utils/redisClient.js
 const Redis = require('ioredis');
-const { redisClusterNodes } = require('../config/keys');
+
+// 하드코딩된 Redis 클러스터 노드 정보 (예시)
+const clusterNodes = [
+  { host: '43.200.132.202', port: 6379 },
+  { host: '43.202.183.198', port: 6379 },
+  { host: '54.180.154.20', port: 6379 },
+  { host: '3.37.73.237', port: 6379 },
+  { host: '43.203.14.223', port: 6379 },
+  { host: '3.37.123.80', port: 6379 },
+];
 
 class RedisClient {
   constructor() {
     this.client = null;
     this.isConnected = false;
     this.connectionAttempts = 0;
-    this.maxRetries = 5;
-    this.retryDelay = 5000;
+    this.maxRetries = 5; // 최대 재시도 횟수
+    this.retryDelay = 5000; // 재시도 간격 (밀리초)
   }
 
   async connect() {
@@ -19,18 +28,15 @@ class RedisClient {
     try {
       console.log('Connecting to Redis Cluster...');
 
-      this.client = new Redis.Cluster(redisClusterNodes, {
-        scaleReads: 'slave',
-        redisOptions: {
-          // 필요하다면 비밀번호 설정
-          // password: process.env.REDIS_PASSWORD || undefined,
-        },
+      this.client = new Redis.Cluster(clusterNodes, {
+        scaleReads: 'master',
         clusterRetryStrategy: (times) => {
           if (times > this.maxRetries) {
+            console.error('Max retries reached for Redis Cluster connection');
             return null;
           }
-          return Math.min(times * 50, 2000);
-        }
+          return Math.min(times * 100, 3000);
+        },
       });
 
       this.client.on('connect', () => {
@@ -42,10 +48,8 @@ class RedisClient {
       this.client.on('error', (err) => {
         console.error('Redis Cluster Error:', err);
         this.isConnected = false;
+        this.retryConnection();
       });
-
-      // // 클러스터 노드 중 하나에 ping을 보내 연결 상태 확인 (선택 사항)
-      // await this.client.nodes('master')[0].ping();
 
       return this.client;
     } catch (error) {
@@ -56,14 +60,27 @@ class RedisClient {
     }
   }
 
-  retryConnection() {
-    if (this.connectionAttempts < this.maxRetries) {
-      this.connectionAttempts++;
-      console.log(`Retrying Redis Cluster connection... Attempt ${this.connectionAttempts}`);
-      setTimeout(() => this.connect(), this.retryDelay);
-    } else {
-      console.error('Max Redis cluster connection retries reached.');
+  async hGetAll(key) {
+  try {
+    if (!this.isConnected) {
+      await this.connect();
     }
+    const data = await this.client.hgetall(key); // ioredis는 hgetall 사용
+    return data;
+  } catch (error) {
+    console.error('Redis hGetAll error:', error);
+    throw error;
+  }
+}
+
+  retryConnection() {
+    if (this.connectionAttempts >= this.maxRetries) {
+      console.error('Max Redis cluster connection retries reached.');
+      return;
+    }
+    this.connectionAttempts++;
+    console.log(`Retrying Redis Cluster connection... Attempt ${this.connectionAttempts}`);
+    setTimeout(() => this.connect(), this.retryDelay);
   }
 
   async set(key, value, options = {}) {
@@ -72,7 +89,7 @@ class RedisClient {
         await this.connect();
       }
 
-      let stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
+      const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
 
       if (options.ttl) {
         return await this.client.setex(key, options.ttl, stringValue);
@@ -91,13 +108,7 @@ class RedisClient {
       }
 
       const value = await this.client.get(key);
-      if (!value) return null;
-
-      try {
-        return JSON.parse(value);
-      } catch {
-        return value; // 문자열인 경우
-      }
+      return this.safeParse(value);
     } catch (error) {
       console.error('Redis cluster get error:', error);
       throw error;
@@ -166,17 +177,21 @@ class RedisClient {
       if (keys.length === 0) return 0;
 
       const pipeline = this.client.multi();
-      keys.forEach(key => pipeline.del(key));
+      keys.forEach((key) => pipeline.del(key));
       const results = await pipeline.exec();
 
-      let deletedCount = 0;
-      for (const [err, reply] of results) {
-        if (!err && reply === 1) deletedCount++;
-      }
-      return deletedCount;
+      return results.filter(([err, reply]) => !err && reply === 1).length;
     } catch (error) {
       console.error('Redis cluster delPattern error:', error);
       throw error;
+    }
+  }
+
+  safeParse(data) {
+    try {
+      return JSON.parse(data);
+    } catch {
+      return data; // 문자열 그대로 반환
     }
   }
 }
