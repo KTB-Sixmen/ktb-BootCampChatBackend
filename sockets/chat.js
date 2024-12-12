@@ -1,6 +1,5 @@
 // backend/sockets/chat.js
 
-const { Kafka } = require("kafkajs");
 const Message = require("../models/Message");
 const Room = require("../models/Room");
 const User = require("../models/User");
@@ -52,180 +51,6 @@ module.exports = function (io) {
 
   // Redis Adapter 설정
   io.adapter(createAdapter(pubClient, subClient));
-
-  const kafka = new Kafka({
-    clientId: process.env.KAFKA_CLIENT_ID || "chat-service",
-    brokers: process.env.KAFKA_BROKERS
-      ? process.env.KAFKA_BROKERS.split(",")
-      : ["localhost:9092"],
-  });
-
-  const producer = kafka.producer();
-  const consumer = kafka.consumer({ groupId: "chat-response-group" });
-  const requestConsumer = kafka.consumer({ groupId: "chat-request-group" });
-
-  (async () => {
-    try {
-      console.log("Kafka Producer 연결 시도...");
-      await producer.connect();
-      console.log("Kafka Producer 연결 성공");
-    } catch (error) {
-      console.error("Kafka Producer 연결 실패:", error);
-    }
-
-    try {
-      console.log("Kafka Response Consumer 연결 시도...");
-      await consumer.connect();
-      console.log("Kafka Response Consumer 연결 성공");
-
-      await consumer.subscribe({
-        topic: "message_responses",
-        fromBeginning: true,
-      });
-      await consumer.subscribe({ topic: "chat_messages", fromBeginning: true });
-
-      await consumer.run({
-  eachMessage: async ({ topic, partition, message }) => {
-    try {
-      const data = JSON.parse(message.value.toString());
-
-      if (topic === "message_responses") {
-        const { roomId, userId, result } = data;
-        io.to(userId).emit("previousMessagesLoaded", result);
-      } else if (topic === "chat_messages") {
-        const { roomId, message: chatMessage } = data;
-
-        // AI 메시지인지 확인
-        const isAIMessage = chatMessage.type === 'ai';
-
-        // AI 메시지가 아닌 경우에만 'message' 이벤트를 통해 전송
-        if (!isAIMessage) {
-          io.to(roomId).emit("message", chatMessage);
-        }
-
-        // Redis 캐시 업데이트 (AI 메시지 포함)
-        const cacheKey = `chat:${roomId}:latest`;
-        const cachedData = await redisClient.get(cacheKey);
-        let messagesArr = [];
-
-        if (cachedData && cachedData.messages) {
-          messagesArr = cachedData.messages;
-        } else if (cachedData) {
-          // Redis에 messages 배열이 없는 경우 초기화
-          messagesArr = [];
-        }
-
-        messagesArr.push(chatMessage);
-
-        if (messagesArr.length > BATCH_SIZE) {
-          messagesArr.splice(0, messagesArr.length - BATCH_SIZE);
-        }
-
-        const hasMore = messagesArr.length === BATCH_SIZE;
-        const oldestTimestamp = messagesArr[0]?.timestamp || null;
-
-        const updatedResult = {
-          messages: messagesArr,
-          hasMore,
-          oldestTimestamp,
-        };
-
-        await redisClient.setEx(cacheKey, 600, updatedResult);
-        console.log(`[Redis] latest 캐시 업데이트: ${cacheKey}`);
-      }
-    } catch (error) {
-      console.error("Kafka consumer(error in eachMessage):", error);
-    }
-  },
-});
-    } catch (error) {
-      console.error("Kafka Response Consumer 연결 실패:", error);
-    }
-
-    try {
-      console.log("Kafka Request Consumer 연결 시도...");
-      await requestConsumer.connect();
-      console.log("Kafka Request Consumer 연결 성공");
-
-      await requestConsumer.subscribe({
-        topic: "message_requests",
-        fromBeginning: true,
-      });
-
-      await requestConsumer.run({
-        eachMessage: async ({ topic, partition, message }) => {
-          try {
-            const { roomId, before, userId } = JSON.parse(
-              message.value.toString()
-            );
-            const cacheKey = `chat:${roomId}:before:${before || "noBefore"}`;
-            const cachedData = await redisClient.get(cacheKey);
-            if (cachedData) {
-              await producer.send({
-                topic: "message_responses",
-                messages: [
-                  {
-                    value: JSON.stringify({
-                      roomId,
-                      userId,
-                      result: cachedData,
-                    }),
-                  },
-                ],
-              });
-              return;
-            }
-
-            const query = { room: roomId };
-            if (before) query.timestamp = { $lt: new Date(before) };
-
-            const messages = await Message.find(query)
-              .populate("sender", "name email profileImage")
-              .populate({
-                path: "file",
-                select: "filename originalname mimetype size",
-              })
-              .sort({ timestamp: -1 })
-              .limit(BATCH_SIZE + 1)
-              .lean();
-
-            const hasMore = messages.length > BATCH_SIZE;
-            const resultMessages = messages.slice(0, BATCH_SIZE);
-            const sortedMessages = resultMessages.sort(
-              (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
-            );
-
-            if (sortedMessages.length > 0) {
-              const messageIds = sortedMessages.map((msg) => msg._id);
-              await Message.updateMany(
-                {
-                  _id: { $in: messageIds },
-                  "readers.userId": { $ne: userId },
-                },
-                { $push: { readers: { userId, readAt: new Date() } } }
-              );
-            }
-
-            const result = {
-              messages: sortedMessages,
-              hasMore,
-              oldestTimestamp: sortedMessages[0]?.timestamp || null,
-            };
-            await redisClient.setEx(cacheKey, 600, result);
-
-            await producer.send({
-              topic: "message_responses",
-              messages: [{ value: JSON.stringify({ roomId, userId, result }) }],
-            });
-          } catch (error) {
-            console.error("Error processing message_requests:", error);
-          }
-        },
-      });
-    } catch (error) {
-      console.error("Kafka Request Consumer 연결 실패:", error);
-    }
-  })();
 
   function logDebug(action, data) {
     console.debug(`[Socket.IO] ${action}:`, {
@@ -449,11 +274,9 @@ module.exports = function (io) {
           { path: "file", select: "filename originalname mimetype size" },
         ]);
 
-        await producer.send({
-          topic: "chat_messages",
-          messages: [{ value: JSON.stringify({ roomId: room, message }) }],
-        });
+        io.to(room).emit("message", message);
 
+        // AI 멘션 처리
         if (aiMentions.length > 0) {
           for (const ai of aiMentions) {
             const query = content
@@ -465,7 +288,7 @@ module.exports = function (io) {
 
         await SessionService.updateLastActivity(socket.user.id);
 
-        /** 가짜 AI 로직 부분 */
+        // 가짜 AI 로직 부분 (원래 kafka에서 다른 처리 했으나 제거)
         const currentCount = roomMessageCountMap.get(room) || 0;
         const newCount = currentCount + 1;
         roomMessageCountMap.set(room, newCount);
@@ -479,31 +302,29 @@ module.exports = function (io) {
             throw new Error("최근 메시지를 가져올 수 없습니다.");
           }
 
+          // 가짜 AI 응답 생성
           const ghostMsg = await aiService.generateGhostResponse(
-            // recentMessage.content,
             message.content,
             "dragonAI"
           );
 
-          // 유령 AI 메시지 전송
+          // 유령 AI 메시지
           const aiMessage = new Message({
             room,
-            content: ghostMsg, // generateGhostResponse로 받은 응답
+            content: ghostMsg,
             type: "ai",
-            aiType: "dragonAI", // ghostAI로 설정
+            aiType: "dragonAI",
             timestamp: new Date(),
             reactions: {},
           });
 
           await aiMessage.save();
 
+          // 유령 AI 메시지 실시간 전송
           io.to(room).emit("message", aiMessage);
-          await producer.send({
-            topic: "chat_messages",
-            messages: [
-              { value: JSON.stringify({ roomId: room, message: aiMessage }) },
-            ],
-          });
+
+          // 캐시 업데이트
+          await updateCacheAfterMessage(room, aiMessage);
 
           // 카운트 초기화
           roomMessageCountMap.set(room, 0);
@@ -515,30 +336,7 @@ module.exports = function (io) {
           room,
         });
 
-        const cacheKey = `chat:${room}:latest`;
-        const cachedData = await redisClient.get(cacheKey);
-        let messagesArr = [];
-        if (cachedData && cachedData.messages) {
-          messagesArr = cachedData.messages;
-        } else if (cachedData) {
-          // Redis에 messages 배열이 없는 경우 초기화
-          messagesArr = [];
-        }
-        messagesArr.push(message.toObject());
-        if (messagesArr.length > BATCH_SIZE) {
-          messagesArr.splice(0, messagesArr.length - BATCH_SIZE);
-        }
-
-        const hasMore = messagesArr.length === BATCH_SIZE;
-        const oldestTimestamp = messagesArr[0]?.timestamp || null;
-        const updatedResult = {
-          messages: messagesArr,
-          hasMore,
-          oldestTimestamp,
-        };
-
-        await redisClient.setEx(cacheKey, 600, updatedResult);
-        console.log(`[Redis] latest 캐시 업데이트: ${cacheKey}`);
+        await updateCacheAfterMessage(room, message);
       } catch (error) {
         console.error("Message handling error:", error);
         socket.emit("error", {
@@ -547,9 +345,6 @@ module.exports = function (io) {
         });
       }
     });
-
-    // 이하 코드는 변동 없음, AI 메시지를 저장할 때도 DB에 메시지 저장하는 로직 포함
-    // handleAIResponse 함수 내 onComplete 콜백에서 aiMessage 생성 후 aiMessage.save() 수행 중
 
     socket.on("joinRoom", async (roomId) => {
       try {
@@ -580,18 +375,8 @@ module.exports = function (io) {
           };
           const leaveMessage = await Message.create(leaveMsg);
 
-          await producer.send({
-            topic: "chat_messages",
-            messages: [
-              {
-                value: JSON.stringify({
-                  roomId: currentRoom,
-                  message: leaveMessage,
-                }),
-              },
-            ],
-          });
-
+          io.to(currentRoom).emit("message", leaveMessage);
+          await updateCacheAfterMessage(currentRoom, leaveMessage);
           socket.to(currentRoom).emit("userLeft", {
             userId: socket.user.id,
             name: socket.user.name,
@@ -651,12 +436,8 @@ module.exports = function (io) {
           activeStreams,
         });
 
-        await producer.send({
-          topic: "chat_messages",
-          messages: [
-            { value: JSON.stringify({ roomId, message: joinMessage }) },
-          ],
-        });
+        io.to(roomId).emit("message", joinMessage);
+        await updateCacheAfterMessage(roomId, joinMessage);
 
         io.to(roomId).emit("participantsUpdate", room.participants);
 
@@ -707,12 +488,8 @@ module.exports = function (io) {
           timestamp: new Date(),
         });
 
-        await producer.send({
-          topic: "chat_messages",
-          messages: [
-            { value: JSON.stringify({ roomId, message: leaveMessage }) },
-          ],
-        });
+        io.to(roomId).emit("message", leaveMessage);
+        await updateCacheAfterMessage(roomId, leaveMessage);
 
         await Room.findByIdAndUpdate(
           roomId,
@@ -764,12 +541,8 @@ module.exports = function (io) {
             timestamp: new Date(),
           });
 
-          await producer.send({
-            topic: "chat_messages",
-            messages: [
-              { value: JSON.stringify({ roomId, message: leaveMessage }) },
-            ],
-          });
+          io.to(roomId).emit("message", leaveMessage);
+          await updateCacheAfterMessage(roomId, leaveMessage);
 
           await Room.findByIdAndUpdate(
             roomId,
@@ -860,6 +633,33 @@ module.exports = function (io) {
         });
       }
     });
+
+    async function updateCacheAfterMessage(roomId, msg) {
+      const cacheKey = `chat:${roomId}:latest`;
+      const cachedData = await redisClient.get(cacheKey);
+      let messagesArr = [];
+      if (cachedData && cachedData.messages) {
+        messagesArr = cachedData.messages;
+      } else if (cachedData) {
+        messagesArr = [];
+      }
+      messagesArr.push(msg.toObject ? msg.toObject() : msg);
+
+      if (messagesArr.length > BATCH_SIZE) {
+        messagesArr.splice(0, messagesArr.length - BATCH_SIZE);
+      }
+
+      const hasMore = messagesArr.length === BATCH_SIZE;
+      const oldestTimestamp = messagesArr[0]?.timestamp || null;
+      const updatedResult = {
+        messages: messagesArr,
+        hasMore,
+        oldestTimestamp,
+      };
+
+      await redisClient.setEx(cacheKey, 600, updatedResult);
+      console.log(`[Redis] latest 캐시 업데이트: ${cacheKey}`);
+    }
   });
 
   async function loadMessages(socket, roomId, before, limit = BATCH_SIZE) {
@@ -877,10 +677,7 @@ module.exports = function (io) {
       const messages = await Promise.race([
         Message.find(query)
           .populate("sender", "name email profileImage")
-          .populate({
-            path: "file",
-            select: "filename originalname mimetype size",
-          })
+          .populate({ path: "file", select: "filename originalname mimetype size" })
           .sort({ timestamp: -1 })
           .limit(limit + 1)
           .lean(),
@@ -889,21 +686,14 @@ module.exports = function (io) {
 
       const hasMore = messages.length > limit;
       const resultMessages = messages.slice(0, limit);
-      const sortedMessages = resultMessages.sort(
-        (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
-      );
+      const sortedMessages = resultMessages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 
       if (sortedMessages.length > 0 && socket.user) {
         const messageIds = sortedMessages.map((msg) => msg._id);
         Message.updateMany(
-          {
-            _id: { $in: messageIds },
-            "readers.userId": { $ne: socket.user.id },
-          },
+          { _id: { $in: messageIds }, "readers.userId": { $ne: socket.user.id } },
           { $push: { readers: { userId: socket.user.id, readAt: new Date() } } }
-        )
-          .exec()
-          .catch((error) => console.error("Read status update error:", error));
+        ).exec().catch((error) => console.error("Read status update error:", error));
       }
 
       return {
@@ -919,19 +709,13 @@ module.exports = function (io) {
 
   async function loadMessagesDirect(query, limit = BATCH_SIZE) {
     const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(
-        () => reject(new Error("Message loading timed out")),
-        MESSAGE_LOAD_TIMEOUT
-      );
+      setTimeout(() => reject(new Error("Message loading timed out")), MESSAGE_LOAD_TIMEOUT);
     });
 
     const messages = await Promise.race([
       Message.find(query)
         .populate("sender", "name email profileImage")
-        .populate({
-          path: "file",
-          select: "filename originalname mimetype size",
-        })
+        .populate({ path: "file", select: "filename originalname mimetype size" })
         .sort({ timestamp: -1 })
         .limit(limit + 1)
         .lean(),
@@ -940,9 +724,7 @@ module.exports = function (io) {
 
     const hasMore = messages.length > limit;
     const resultMessages = messages.slice(0, limit);
-    const sortedMessages = resultMessages.sort(
-      (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
-    );
+    const sortedMessages = resultMessages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
     const oldestTimestamp = sortedMessages[0]?.timestamp || null;
 
     return { messages: sortedMessages, hasMore, oldestTimestamp };
@@ -957,13 +739,9 @@ module.exports = function (io) {
       "refuteAI",
       "agentB",
       "hankangAI",
-      // "용가리",
-      // "ghostAI",
-      // "dragonAI",
     ];
     const mentions = new Set();
-    const mentionRegex =
-      /@(wayneAI|consultingAI|spellingAI|refuteAI|agentB|hankangAI)\b/g;
+    const mentionRegex = /@(wayneAI|consultingAI|spellingAI|refuteAI|agentB|hankangAI)\b/g;
     let match;
     while ((match = mentionRegex.exec(content)) !== null) {
       if (aiTypes.includes(match[1])) mentions.add(match[1]);
@@ -986,11 +764,7 @@ module.exports = function (io) {
       reactions: {},
     };
 
-    await redisClient.hSet(
-      STREAMING_SESSIONS_KEY,
-      messageId,
-      JSON.stringify(sessionData)
-    );
+    await redisClient.hSet(STREAMING_SESSIONS_KEY, messageId, JSON.stringify(sessionData));
 
     logDebug("AI response started", { messageId, aiType: aiName, room, query });
 
@@ -1002,8 +776,7 @@ module.exports = function (io) {
 
     try {
       await aiService.generateResponse(query, aiName, {
-        onStart: () =>
-          logDebug("AI generation started", { messageId, aiType: aiName }),
+        onStart: () => logDebug("AI generation started", { messageId, aiType: aiName }),
         onChunk: async (chunk) => {
           accumulatedContent += chunk.currentChunk || "";
           const updatedSession = {
@@ -1011,11 +784,7 @@ module.exports = function (io) {
             content: accumulatedContent,
             lastUpdate: Date.now(),
           };
-          await redisClient.hSet(
-            STREAMING_SESSIONS_KEY,
-            messageId,
-            JSON.stringify(updatedSession)
-          );
+          await redisClient.hSet(STREAMING_SESSIONS_KEY, messageId, JSON.stringify(updatedSession));
 
           io.to(room).emit("aiMessageChunk", {
             messageId,
@@ -1051,13 +820,6 @@ module.exports = function (io) {
             { path: "file", select: "filename originalname mimetype size" },
           ]);
 
-          await producer.send({
-            topic: "chat_messages",
-            messages: [
-              { value: JSON.stringify({ roomId: room, message: aiMessage }) },
-            ],
-          });
-
           io.to(room).emit("aiMessageComplete", {
             messageId,
             _id: aiMessage._id,
@@ -1068,6 +830,8 @@ module.exports = function (io) {
             query,
             reactions: {},
           });
+
+          await updateCacheAfterMessage(room, aiMessage);
 
           logDebug("AI response completed", {
             messageId,
@@ -1108,6 +872,33 @@ module.exports = function (io) {
         aiType: aiName,
         error: error.message,
       });
+    }
+
+    async function updateCacheAfterMessage(roomId, msg) {
+      const cacheKey = `chat:${roomId}:latest`;
+      const cachedData = await redisClient.get(cacheKey);
+      let messagesArr = [];
+      if (cachedData && cachedData.messages) {
+        messagesArr = cachedData.messages;
+      } else if (cachedData) {
+        messagesArr = [];
+      }
+      messagesArr.push(msg.toObject ? msg.toObject() : msg);
+
+      if (messagesArr.length > BATCH_SIZE) {
+        messagesArr.splice(0, messagesArr.length - BATCH_SIZE);
+      }
+
+      const hasMore = messagesArr.length === BATCH_SIZE;
+      const oldestTimestamp = messagesArr[0]?.timestamp || null;
+      const updatedResult = {
+        messages: messagesArr,
+        hasMore,
+        oldestTimestamp,
+      };
+
+      await redisClient.setEx(cacheKey, 600, updatedResult);
+      console.log(`[Redis] latest 캐시 업데이트: ${cacheKey}`);
     }
   }
 
