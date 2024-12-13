@@ -289,46 +289,46 @@ module.exports = function (io) {
         await SessionService.updateLastActivity(socket.user.id);
 
         // 가짜 AI 로직 부분 (원래 kafka에서 다른 처리 했으나 제거)
-        const currentCount = roomMessageCountMap.get(room) || 0;
-        const newCount = currentCount + 1;
-        roomMessageCountMap.set(room, newCount);
+        // const currentCount = roomMessageCountMap.get(room) || 0;
+        // const newCount = currentCount + 1;
+        // roomMessageCountMap.set(room, newCount);
 
-        if (newCount >= 2) {
-          const recentMessage = await Message.findOne({ room })
-            .sort({ timestamp: -1 })
-            .lean();
+        // if (newCount >= 2) {
+        //   const recentMessage = await Message.findOne({ room })
+        //     .sort({ timestamp: -1 })
+        //     .lean();
 
-          if (!recentMessage) {
-            throw new Error("최근 메시지를 가져올 수 없습니다.");
-          }
+        //   if (!recentMessage) {
+        //     throw new Error("최근 메시지를 가져올 수 없습니다.");
+        //   }
 
-          // 가짜 AI 응답 생성
-          const ghostMsg = await aiService.generateGhostResponse(
-            message.content,
-            "dragonAI"
-          );
+        //   // 가짜 AI 응답 생성
+        //   const ghostMsg = await aiService.generateGhostResponse(
+        //     message.content,
+        //     "dragonAI"
+        //   );
 
-          // 유령 AI 메시지
-          const aiMessage = new Message({
-            room,
-            content: ghostMsg,
-            type: "ai",
-            aiType: "dragonAI",
-            timestamp: new Date(),
-            reactions: {},
-          });
+        //   // 유령 AI 메시지
+        //   const aiMessage = new Message({
+        //     room,
+        //     content: ghostMsg,
+        //     type: "ai",
+        //     aiType: "dragonAI",
+        //     timestamp: new Date(),
+        //     reactions: {},
+        //   });
 
-          await aiMessage.save();
+        //   await aiMessage.save();
 
-          // 유령 AI 메시지 실시간 전송
-          io.to(room).emit("message", aiMessage);
+        //   // 유령 AI 메시지 실시간 전송
+        //   io.to(room).emit("message", aiMessage);
 
-          // 캐시 업데이트
-          await updateCacheAfterMessage(room, aiMessage);
+        //   // 캐시 업데이트
+        //   await updateCacheAfterMessage(room, aiMessage);
 
-          // 카운트 초기화
-          roomMessageCountMap.set(room, 0);
-        }
+        //   // 카운트 초기화
+        //   roomMessageCountMap.set(room, 0);
+        // }
 
         logDebug("message processed", {
           messageId: message._id,
@@ -677,7 +677,10 @@ module.exports = function (io) {
       const messages = await Promise.race([
         Message.find(query)
           .populate("sender", "name email profileImage")
-          .populate({ path: "file", select: "filename originalname mimetype size" })
+          .populate({
+            path: "file",
+            select: "filename originalname mimetype size",
+          })
           .sort({ timestamp: -1 })
           .limit(limit + 1)
           .lean(),
@@ -686,14 +689,21 @@ module.exports = function (io) {
 
       const hasMore = messages.length > limit;
       const resultMessages = messages.slice(0, limit);
-      const sortedMessages = resultMessages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+      const sortedMessages = resultMessages.sort(
+        (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
+      );
 
       if (sortedMessages.length > 0 && socket.user) {
         const messageIds = sortedMessages.map((msg) => msg._id);
         Message.updateMany(
-          { _id: { $in: messageIds }, "readers.userId": { $ne: socket.user.id } },
+          {
+            _id: { $in: messageIds },
+            "readers.userId": { $ne: socket.user.id },
+          },
           { $push: { readers: { userId: socket.user.id, readAt: new Date() } } }
-        ).exec().catch((error) => console.error("Read status update error:", error));
+        )
+          .exec()
+          .catch((error) => console.error("Read status update error:", error));
       }
 
       return {
@@ -709,13 +719,19 @@ module.exports = function (io) {
 
   async function loadMessagesDirect(query, limit = BATCH_SIZE) {
     const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error("Message loading timed out")), MESSAGE_LOAD_TIMEOUT);
+      setTimeout(
+        () => reject(new Error("Message loading timed out")),
+        MESSAGE_LOAD_TIMEOUT
+      );
     });
 
     const messages = await Promise.race([
       Message.find(query)
         .populate("sender", "name email profileImage")
-        .populate({ path: "file", select: "filename originalname mimetype size" })
+        .populate({
+          path: "file",
+          select: "filename originalname mimetype size",
+        })
         .sort({ timestamp: -1 })
         .limit(limit + 1)
         .lean(),
@@ -724,7 +740,9 @@ module.exports = function (io) {
 
     const hasMore = messages.length > limit;
     const resultMessages = messages.slice(0, limit);
-    const sortedMessages = resultMessages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    const sortedMessages = resultMessages.sort(
+      (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
+    );
     const oldestTimestamp = sortedMessages[0]?.timestamp || null;
 
     return { messages: sortedMessages, hasMore, oldestTimestamp };
@@ -741,7 +759,8 @@ module.exports = function (io) {
       "hankangAI",
     ];
     const mentions = new Set();
-    const mentionRegex = /@(wayneAI|consultingAI|spellingAI|refuteAI|agentB|hankangAI)\b/g;
+    const mentionRegex =
+      /@(wayneAI|consultingAI|spellingAI|refuteAI|agentB|hankangAI)\b/g;
     let match;
     while ((match = mentionRegex.exec(content)) !== null) {
       if (aiTypes.includes(match[1])) mentions.add(match[1]);
@@ -764,7 +783,11 @@ module.exports = function (io) {
       reactions: {},
     };
 
-    await redisClient.hSet(STREAMING_SESSIONS_KEY, messageId, JSON.stringify(sessionData));
+    await redisClient.hSet(
+      STREAMING_SESSIONS_KEY,
+      messageId,
+      JSON.stringify(sessionData)
+    );
 
     logDebug("AI response started", { messageId, aiType: aiName, room, query });
 
@@ -776,7 +799,8 @@ module.exports = function (io) {
 
     try {
       await aiService.generateResponse(query, aiName, {
-        onStart: () => logDebug("AI generation started", { messageId, aiType: aiName }),
+        onStart: () =>
+          logDebug("AI generation started", { messageId, aiType: aiName }),
         onChunk: async (chunk) => {
           accumulatedContent += chunk.currentChunk || "";
           const updatedSession = {
@@ -784,7 +808,11 @@ module.exports = function (io) {
             content: accumulatedContent,
             lastUpdate: Date.now(),
           };
-          await redisClient.hSet(STREAMING_SESSIONS_KEY, messageId, JSON.stringify(updatedSession));
+          await redisClient.hSet(
+            STREAMING_SESSIONS_KEY,
+            messageId,
+            JSON.stringify(updatedSession)
+          );
 
           io.to(room).emit("aiMessageChunk", {
             messageId,
